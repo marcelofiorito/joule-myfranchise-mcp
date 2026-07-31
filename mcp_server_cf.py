@@ -130,14 +130,18 @@ def get_lojas_em_risco(
     Exemplo: get_lojas_em_risco(regiao='NE', categoria='Sandálias')
     """
     try:
-        params = {"$filter": "estoqueCriticality lt 3"}
+        # status_code filtrável; estoqueCriticality é @Core.Computed (não filtrável via OData)
+        filt_parts = ["status_code ne 'OK'"]
         if regiao:
-            params["$filter"] += f" and regiaoCode eq '{regiao}'"
+            filt_parts.append(f"regiaoCode eq '{regiao}'")
         if categoria:
-            params["$filter"] += f" and categoria eq '{categoria}'"
-        params["$select"] = "unidadeNome,unidadeCidade,regiaoCode,sku,nomeProduto,saldoAtual,coberturaDias,leadTimeDias,estoqueCriticality,status_code"
-        params["$orderby"] = "coberturaDias asc"
-        params["$top"] = "20"
+            filt_parts.append(f"categoria eq '{categoria}'")
+        params = {
+            "$filter":  " and ".join(filt_parts),
+            "$select":  "unidadeNome,unidadeCidade,regiaoCode,sku,nomeProduto,saldoAtual,coberturaDias,leadTimeDias,estoqueCriticality,status_code",
+            "$orderby": "coberturaDias asc",
+            "$top":     "20",
+        }
 
         data = odata("Estoque_Unidade", params)
         items = data.get("value", [])
