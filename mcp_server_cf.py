@@ -130,21 +130,24 @@ def get_lojas_em_risco(
     Exemplo: get_lojas_em_risco(regiao='NE', categoria='Sandálias')
     """
     try:
-        # status_code filtrável; estoqueCriticality é @Core.Computed (não filtrável via OData)
-        filt_parts = ["status_code ne 'OK'"]
+        # buscar sem filtro OData (campos computados/projetados não são filtráveis),
+        # filtrar em Python após receber os dados
+        filt_parts = []
         if regiao:
             filt_parts.append(f"regiaoCode eq '{regiao}'")
         if categoria:
             filt_parts.append(f"categoria eq '{categoria}'")
         params = {
-            "$filter":  " and ".join(filt_parts),
-            "$select":  "unidadeNome,unidadeCidade,regiaoCode,sku,nomeProduto,saldoAtual,coberturaDias,leadTimeDias,estoqueCriticality,status_code",
-            "$orderby": "coberturaDias asc",
-            "$top":     "20",
+            "$select":  "unidade_ID,unidadeNome,unidadeCidade,regiaoCode,sku,nomeProduto,saldoAtual,coberturaDias,leadTimeDias,estoqueCriticality",
+            "$top":     "200",
         }
+        if filt_parts:
+            params["$filter"] = " and ".join(filt_parts)
 
         data = odata("Estoque_Unidade", params)
-        items = data.get("value", [])
+        # filtrar em Python: só itens com criticality 1 ou 2 (não OK)
+        items = [i for i in data.get("value", []) if i.get("estoqueCriticality", 3) < 3]
+        items.sort(key=lambda i: float(i.get("coberturaDias") or 999))
 
         if not items:
             return json.dumps({"total": 0, "mensagem": "Nenhuma loja em risco encontrada com os filtros informados.", "mes_referencia": MES_REF})
