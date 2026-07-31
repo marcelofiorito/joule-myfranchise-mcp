@@ -1,0 +1,18 @@
+---
+applications:
+  - name: joule-myfranchise-mcp
+    memory: 256M
+    disk_quota: 512M
+    instances: 1
+    buildpacks:
+      - python_buildpack
+    command: python mcp_server_cf.py
+    health-check-type: http
+    health-check-http-endpoint: /health
+    env:
+      SRV_URL: https://sa-build-platform-org-dev-myfranchise-srv.cfapps.us10.hana.ondemand.com
+      TOKEN_URL: https://build-platform-rfm61ms1.authentication.us10.hana.ondemand.com/oauth/token
+      CLIENT_ID: sb-myfranchise-DEV!t597567
+      # CLIENT_SECRET deve ser definido via:
+      #   cf set-env joule-myfranchise-mcp CLIENT_SECRET <secret>
+      # MCP_AUTH_TOKEN deve ser um UUID secreto para proteger o endpoint
