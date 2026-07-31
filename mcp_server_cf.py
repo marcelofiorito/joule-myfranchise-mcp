@@ -309,40 +309,38 @@ def get_score_rede(
         return json.dumps({"erro": str(e)})
 
 # ─── Health endpoint ──────────────────────────────────────────────
-from starlette.applications import Starlette
-from starlette.responses import JSONResponse
-from starlette.routing import Route, Mount
-
-async def health(request):
-    return JSONResponse({
-        "status": "UP",
-        "service": "joule-myfranchise-mcp",
-        "version": "1.0.0",
-        "tools": ["get_lojas_em_risco", "get_cobertura_estoque", "get_pedidos_pendentes",
-                  "get_recomendacoes", "get_score_rede"],
-        "mes_referencia": MES_REF,
-    })
 
 # ─── Montar aplicação ASGI ────────────────────────────────────────
 mcp_app = mcp.streamable_http_app()
 
 # ─── Montar aplicação ASGI ────────────────────────────────────────
-# IMPORTANTE: Mount na raiz "/" para evitar 307 redirect do Starlette.
-# O Joule Studio não segue redirects — /mcp → /mcp/ causa 404.
-# Solução: health em /health, MCP montado na raiz (captura tudo exceto /health).
+# Padrão do joule-sfsf-mcp: o streamable_http_app() já expõe em /mcp
+# internamente. Adicionamos /health via middleware — sem Mount que causa 307.
+from starlette.middleware.base import BaseHTTPMiddleware
+from starlette.requests import Request as StarletteRequest
+
 mcp_app = mcp.streamable_http_app()
 
-app = Starlette(
-    routes=[
-        Route("/health", health),
-        Mount("/", mcp_app),   # MCP na raiz — sem trailing slash redirect
-    ]
-)
+class HealthMiddleware(BaseHTTPMiddleware):
+    async def dispatch(self, request: StarletteRequest, call_next):
+        if request.url.path == "/health":
+            from starlette.responses import JSONResponse
+            return JSONResponse({
+                "status": "UP",
+                "service": "joule-myfranchise-mcp",
+                "version": "1.0.0",
+                "tools": ["get_lojas_em_risco", "get_cobertura_estoque",
+                          "get_pedidos_pendentes", "get_recomendacoes", "get_score_rede"],
+                "mes_referencia": MES_REF,
+            })
+        return await call_next(request)
+
+app = HealthMiddleware(mcp_app)
 
 # ─── Iniciar servidor ─────────────────────────────────────────────
 if __name__ == "__main__":
     import uvicorn
     print(f"✅ joule-myfranchise-mcp iniciado na porta {PORT}")
     print(f"   Health: http://localhost:{PORT}/health")
-    print(f"   MCP:    http://localhost:{PORT}/")
+    print(f"   MCP:    http://localhost:{PORT}/mcp")
     uvicorn.run(app, host="0.0.0.0", port=PORT)
