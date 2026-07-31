@@ -1,24 +1,25 @@
 #!/usr/bin/env python3
 """
-MCP Server — RunMyFranchise Joule (Cloud Foundry / SSE transport)
+MCP Server — RunMyFranchise Joule (Cloud Foundry)
 
-Expõe ferramentas para o SAP Joule consultar dados da rede de franquias.
-Conecta ao backend CAP via OData V4 (/franqueadora) com token client_credentials.
+Padrão: igual ao joule-sfsf-mcp / pocsfsf.
+- Destination sem auth (NoAuthentication)
+- Token OAuth2 obtido internamente via client_credentials do XSUAA
+- TransportSecuritySettings para evitar 421 no CF Go Router
 
-Variáveis de ambiente obrigatórias (cf set-env):
-  SRV_URL         = URL do myfranchise-srv (ex: https://sa-build-platform-org-dev-myfranchise-srv.cfapps.us10.hana.ondemand.com)
-  TOKEN_URL       = URL do token XSUAA (ex: https://<tenant>.authentication.us10.hana.ondemand.com/oauth/token)
-  CLIENT_ID       = clientid do XSUAA (sb-myfranchise-DEV!t597567)
-  CLIENT_SECRET   = clientsecret do XSUAA (cf set-env joule-myfranchise-mcp CLIENT_SECRET <secret>)
-  MCP_AUTH_TOKEN  = token secreto para autenticar o Joule Studio (defina um UUID)
-
-Variáveis opcionais:
-  PORT            = porta HTTP (padrão: 8080, CF injeta automaticamente)
-  MES_REFERENCIA  = mês de referência para sazonalidade (padrão: 7)
+Variáveis de ambiente (cf set-env):
+  SRV_URL        = URL do myfranchise-srv
+  TOKEN_URL      = https://<tenant>.authentication.us10.hana.ondemand.com/oauth/token
+  CLIENT_ID      = clientid do XSUAA
+  CLIENT_SECRET  = clientsecret do XSUAA
+  PORT           = porta (CF injeta automaticamente)
+  MES_REFERENCIA = mês de referência sazonal (padrão: 7)
 """
 
 import os
 import json
+import time
+import datetime
 import requests
 from mcp.server.fastmcp import FastMCP
 try:
@@ -27,66 +28,43 @@ try:
 except ImportError:
     _has_transport_security = False
 
-# Host do CF onde o app está rodando (evita 421 DNS rebinding protection)
-CF_HOST = os.environ.get("CF_HOST", "joule-myfranchise-mcp.cfapps.us10.hana.ondemand.com")
-
 # ─── Configuração ─────────────────────────────────────────────────
-SRV_URL        = os.environ.get("SRV_URL", "http://localhost:4004")
-TOKEN_URL      = os.environ.get("TOKEN_URL", "")
-CLIENT_ID      = os.environ.get("CLIENT_ID", "")
-CLIENT_SECRET  = os.environ.get("CLIENT_SECRET", "")
-MCP_AUTH_TOKEN = os.environ.get("MCP_AUTH_TOKEN", "")
-MES_REF        = int(os.environ.get("MES_REFERENCIA", "7"))
-PORT           = int(os.environ.get("PORT", "8080"))
+SRV_URL       = os.environ.get("SRV_URL", "http://localhost:4004")
+TOKEN_URL     = os.environ.get("TOKEN_URL", "")
+CLIENT_ID     = os.environ.get("CLIENT_ID", "")
+CLIENT_SECRET = os.environ.get("CLIENT_SECRET", "")
+MES_REF       = int(os.environ.get("MES_REFERENCIA", "7"))
+PORT          = int(os.environ.get("PORT", "8080"))
+CF_HOST       = os.environ.get("CF_HOST", "joule-myfranchise-mcp.cfapps.us10.hana.ondemand.com")
 
 # ─── Token cache ──────────────────────────────────────────────────
 _token_cache: dict = {}
 
 def get_token() -> str:
-    """Obtém token client_credentials do XSUAA (com cache simples)."""
-    import time
+    """Obtém Bearer token via XSUAA client_credentials (com cache)."""
     now = time.time()
-    if _token_cache.get("token") and _token_cache.get("expires", 0) > now + 60:
+    if _token_cache.get("expires_at", 0) - 30 > now:
         return _token_cache["token"]
-
-    if not TOKEN_URL or not CLIENT_ID or not CLIENT_SECRET:
-        return ""  # modo dev local sem auth
-
-import contextvars
-
-# Token propagado pelo Joule via Authorization header da destination OAuth2
-_request_token: contextvars.ContextVar[str] = contextvars.ContextVar('request_token', default='')
-
-def get_token() -> str:
-    """Retorna o token da request atual (injetado pelo middleware) ou gera via client_credentials."""
-    import time
-    # preferir token propagado pelo Joule Studio via destination OAuth2ClientCredentials
-    req_token = _request_token.get('')
-    if req_token:
-        return req_token
-
-    now = time.time()
-    if _token_cache.get("token") and _token_cache.get("expires", 0) > now + 60:
-        return _token_cache["token"]
-
     if not TOKEN_URL or not CLIENT_ID or not CLIENT_SECRET:
         return ""
-
-    resp = requests.post(TOKEN_URL, data={
-        "grant_type": "client_credentials",
-        "client_id": CLIENT_ID,
-        "client_secret": CLIENT_SECRET,
-    }, timeout=15)
-    resp.raise_for_status()
-    data = resp.json()
-    _token_cache["token"]   = data["access_token"]
-    _token_cache["expires"] = now + data.get("expires_in", 3600)
-    return _token_cache["token"]
+    try:
+        r = requests.post(
+            TOKEN_URL,
+            auth=(CLIENT_ID, CLIENT_SECRET),
+            data={"grant_type": "client_credentials"},
+            timeout=10,
+        )
+        token = r.json().get("access_token", "") if r.status_code == 200 else ""
+        _token_cache["token"]      = token
+        _token_cache["expires_at"] = now + 3500
+        return token
+    except Exception:
+        return ""
 
 def odata(path: str, params: dict = None) -> dict:
-    """Chama a OData API do myfranchise-srv com token."""
-    headers = {"Accept": "application/json"}
+    """Chama a OData API do myfranchise-srv com token Bearer."""
     token = get_token()
+    headers = {"Accept": "application/json"}
     if token:
         headers["Authorization"] = f"Bearer {token}"
     url = f"{SRV_URL}/franqueadora/{path}"
@@ -94,263 +72,195 @@ def odata(path: str, params: dict = None) -> dict:
     resp.raise_for_status()
     return resp.json()
 
-# ─── FastMCP Server ───────────────────────────────────────────────
-mcp_kwargs = {
+# ─── FastMCP ──────────────────────────────────────────────────────
+_mcp_kwargs = {
     "instructions": (
-        "Você é o assistente inteligente da rede de franquias RunMyFranchise. "
-        "Use as ferramentas disponíveis para responder perguntas sobre estoque, "
-        "risco de ruptura, recomendações da IA, score de saúde e pedidos de reposição. "
-        "Considere sempre a sazonalidade regional: Havaianas em julho têm demanda "
-        "muito maior no Nordeste do que no Sul. Apresente números de forma clara."
+        "Você é o assistente da rede de franquias RunMyFranchise. "
+        "Use as ferramentas para responder sobre estoque, ruptura, "
+        "recomendações da IA e score de saúde das lojas. "
+        "Considere sazonalidade: Havaianas em julho têm demanda 1,8x no NE e 0,4x no Sul."
     ),
 }
 if _has_transport_security:
-    mcp_kwargs["transport_security"] = TransportSecuritySettings(
+    _mcp_kwargs["transport_security"] = TransportSecuritySettings(
         enable_dns_rebinding_protection=True,
-        allowed_hosts=[
-            CF_HOST,
-            "localhost:*",
-            "127.0.0.1:*",
-            "*.cfapps.us10.hana.ondemand.com",
-        ],
+        allowed_hosts=[CF_HOST, "localhost:*", "127.0.0.1:*", "*.cfapps.us10.hana.ondemand.com"],
     )
 
-mcp = FastMCP("RunMyFranchise Joule", **mcp_kwargs)
+mcp = FastMCP("RunMyFranchise Joule", **_mcp_kwargs)
 
 # ─── TOOL 1: lojas em risco de ruptura ───────────────────────────
 @mcp.tool()
-def get_lojas_em_risco(
-    regiao: str = "",
-    categoria: str = "",
-) -> str:
+def get_lojas_em_risco(regiao: str = "", categoria: str = "") -> str:
     """
-    Lista lojas com risco de ruptura de estoque, considerando sazonalidade regional.
-    Use regiao para filtrar (NE, S, SE, CO, N). Use categoria para filtrar por produto (ex: Sandálias).
-    Retorna cobertura em dias, fator sazonal e criticidade (RUPTURA IMINENTE ou ATENÇÃO).
+    Lista lojas com risco de ruptura de estoque (cobertura < lead time), considerando
+    sazonalidade regional. Filtre por regiao (NE, S, SE, CO, N) e/ou categoria (ex: Sandálias).
     Exemplo: get_lojas_em_risco(regiao='NE', categoria='Sandálias')
     """
     try:
-        # buscar sem filtro OData (campos computados/projetados não são filtráveis),
-        # filtrar em Python após receber os dados
-        filt_parts = []
+        data  = odata("Estoque_Unidade", {
+            "$select": "unidade_ID,unidadeNome,unidadeCidade,regiaoCode,sku,nomeProduto,categoria,saldoAtual,coberturaDias,leadTimeDias,estoqueCriticality",
+            "$top": "200",
+        })
+        items = data.get("value", [])
         if regiao:
-            filt_parts.append(f"regiaoCode eq '{regiao}'")
+            items = [i for i in items if i.get("regiaoCode") == regiao]
         if categoria:
-            filt_parts.append(f"categoria eq '{categoria}'")
-        params = {
-            "$select":  "unidade_ID,unidadeNome,unidadeCidade,regiaoCode,sku,nomeProduto,saldoAtual,coberturaDias,leadTimeDias,estoqueCriticality",
-            "$top":     "200",
-        }
-        if filt_parts:
-            params["$filter"] = " and ".join(filt_parts)
-
-        data = odata("Estoque_Unidade", params)
-        # filtrar em Python: só itens com criticality 1 ou 2 (não OK)
-        items = [i for i in data.get("value", []) if i.get("estoqueCriticality", 3) < 3]
+            items = [i for i in items if (i.get("categoria") or "").lower() == categoria.lower()]
+        items = [i for i in items if int(i.get("estoqueCriticality") or 3) < 3]
         items.sort(key=lambda i: float(i.get("coberturaDias") or 999))
 
         if not items:
-            return json.dumps({"total": 0, "mensagem": "Nenhuma loja em risco encontrada com os filtros informados.", "mes_referencia": MES_REF})
+            return json.dumps({"total": 0, "mensagem": "Nenhuma loja em risco com esses filtros.", "mes_referencia": MES_REF})
 
-        lojas = [{
-            "loja":         i.get("unidadeNome"),
-            "cidade":       i.get("unidadeCidade"),
-            "regiao":       i.get("regiaoCode"),
-            "sku":          i.get("sku"),
-            "produto":      i.get("nomeProduto"),
-            "saldo":        i.get("saldoAtual"),
-            "coberturaDias": i.get("coberturaDias"),
-            "leadTime":     i.get("leadTimeDias"),
-            "criticidade":  "RUPTURA IMINENTE" if i.get("estoqueCriticality") == 1 else "ATENÇÃO",
-        } for i in items]
-
-        return json.dumps({"total": len(lojas), "mes_referencia": MES_REF, "lojas": lojas}, ensure_ascii=False, indent=2)
+        return json.dumps({
+            "total": len(items),
+            "mes_referencia": MES_REF,
+            "lojas": [{
+                "loja":         i.get("unidadeNome"),
+                "cidade":       i.get("unidadeCidade"),
+                "regiao":       i.get("regiaoCode"),
+                "produto":      i.get("nomeProduto"),
+                "saldo":        i.get("saldoAtual"),
+                "coberturaDias": i.get("coberturaDias"),
+                "leadTime":     i.get("leadTimeDias"),
+                "criticidade":  "RUPTURA IMINENTE" if int(i.get("estoqueCriticality") or 3) == 1 else "ATENÇÃO",
+            } for i in items]
+        }, ensure_ascii=False, indent=2)
     except Exception as e:
         return json.dumps({"erro": str(e)})
 
-# ─── TOOL 2: cobertura de um SKU numa loja ────────────────────────
+# ─── TOOL 2: cobertura de SKU numa loja ──────────────────────────
 @mcp.tool()
-def get_cobertura_estoque(
-    unidade_id: str,
-    sku: str = "",
-) -> str:
+def get_cobertura_estoque(unidade_id: str, sku: str = "") -> str:
     """
-    Retorna a cobertura de estoque em dias de uma loja, com sazonalidade regional aplicada.
-    unidade_id: ID da loja (ex: u178). sku: código do SKU (ex: SKU-100), opcional.
+    Retorna cobertura de estoque em dias de uma loja, com sazonalidade aplicada.
+    unidade_id: ID da loja (ex: u178). sku: código do SKU (opcional).
     Exemplo: get_cobertura_estoque(unidade_id='u178', sku='SKU-100')
     """
     try:
-        filt = f"unidade_ID eq '{unidade_id}'"
-        if sku:
-            filt += f" and sku eq '{sku}'"
-        data = odata("Estoque_Unidade", {
-            "$filter": filt,
-            "$select": "unidadeNome,unidadeCidade,regiaoCode,sku,nomeProduto,saldoAtual,coberturaDias,leadTimeDias,estoqueCriticality",
+        data  = odata("Estoque_Unidade", {
+            "$select": "unidade_ID,unidadeNome,unidadeCidade,regiaoCode,sku,nomeProduto,saldoAtual,coberturaDias,leadTimeDias,estoqueCriticality",
+            "$top": "200",
         })
-        items = data.get("value", [])
+        items = [i for i in data.get("value", []) if i.get("unidade_ID") == unidade_id]
+        if sku:
+            items = [i for i in items if i.get("sku") == sku]
         if not items:
             return json.dumps({"erro": f"Nenhum item encontrado para {unidade_id}"})
-
         u = items[0]
-        itens = [{
-            "sku":          i.get("sku"),
-            "produto":      i.get("nomeProduto"),
-            "saldo":        i.get("saldoAtual"),
-            "coberturaDias": i.get("coberturaDias"),
-            "leadTime":     i.get("leadTimeDias"),
-            "status":       "RUPTURA IMINENTE" if i.get("estoqueCriticality") == 1 else "ATENÇÃO" if i.get("estoqueCriticality") == 2 else "OK",
-        } for i in items]
-
         return json.dumps({
             "loja":    u.get("unidadeNome"),
             "cidade":  u.get("unidadeCidade"),
             "regiao":  u.get("regiaoCode"),
             "mes_referencia": MES_REF,
-            "itens":   itens,
+            "itens": [{
+                "sku":          i.get("sku"),
+                "produto":      i.get("nomeProduto"),
+                "saldo":        i.get("saldoAtual"),
+                "coberturaDias": i.get("coberturaDias"),
+                "leadTime":     i.get("leadTimeDias"),
+                "status":       "RUPTURA IMINENTE" if int(i.get("estoqueCriticality") or 3) == 1 else "ATENÇÃO" if int(i.get("estoqueCriticality") or 3) == 2 else "OK",
+            } for i in items]
         }, ensure_ascii=False, indent=2)
     except Exception as e:
         return json.dumps({"erro": str(e)})
 
-# ─── TOOL 3: pedidos de reposição pendentes ────────────────────────
+# ─── TOOL 3: pedidos pendentes ────────────────────────────────────
 @mcp.tool()
-def get_pedidos_pendentes(
-    unidade_id: str = "",
-    status: str = "PENDENTE",
-) -> str:
+def get_pedidos_pendentes(unidade_id: str = "") -> str:
     """
-    Lista pedidos de reposição aguardando aprovação (status PENDENTE por padrão).
-    unidade_id: filtrar por loja (opcional). status: PENDENTE, APROVADO, RECUSADO, ENVIADO, RECEBIDO.
-    Exemplo: get_pedidos_pendentes() ou get_pedidos_pendentes(unidade_id='u178')
+    Lista pedidos de reposição aguardando aprovação (status PENDENTE).
+    unidade_id: filtrar por loja (opcional).
     """
     try:
-        filt = f"status_code eq '{status}'"
+        data  = odata("Pedidos_Reposicao", {"$top": "100"})
+        items = [i for i in data.get("value", []) if i.get("status_code") == "PENDENTE"]
         if unidade_id:
-            filt += f" and unidade_ID eq '{unidade_id}'"
-        data = odata("Pedidos_Reposicao", {
-            "$filter": filt,
-            "$select": "unidade_ID,sku,nomeProduto,qtdSugerida,fornecedorSugerido,prazoDesejado,status_code,origem,justificativa",
-            "$orderby": "createdAt desc",
-        })
-        items = data.get("value", [])
+            items = [i for i in items if i.get("unidade_ID") == unidade_id]
 
-        # Enriquecer com nomes das unidades
-        unidades_data = odata("Unidades", {"$select": "ID,nome,cidade"})
-        um = {u["ID"]: u for u in unidades_data.get("value", [])}
+        unids = {u["ID"]: u for u in odata("Unidades", {"$select": "ID,nome,cidade", "$top": "100"}).get("value", [])}
 
-        pedidos = [{
-            "loja":          um.get(i.get("unidade_ID"), {}).get("nome", i.get("unidade_ID")),
-            "cidade":        um.get(i.get("unidade_ID"), {}).get("cidade"),
-            "sku":           i.get("sku"),
-            "produto":       i.get("nomeProduto"),
-            "qtdSugerida":   i.get("qtdSugerida"),
-            "fornecedor":    i.get("fornecedorSugerido"),
-            "prazo":         i.get("prazoDesejado"),
-            "status":        i.get("status_code"),
-            "origem":        i.get("origem"),
-            "justificativa": i.get("justificativa"),
-        } for i in items]
-
-        return json.dumps({"total": len(pedidos), "status": status, "pedidos": pedidos}, ensure_ascii=False, indent=2)
+        return json.dumps({
+            "total": len(items),
+            "pedidos": [{
+                "loja":        unids.get(i.get("unidade_ID"), {}).get("nome", i.get("unidade_ID")),
+                "cidade":      unids.get(i.get("unidade_ID"), {}).get("cidade"),
+                "produto":     i.get("nomeProduto"),
+                "sku":         i.get("sku"),
+                "qtdSugerida": i.get("qtdSugerida"),
+                "fornecedor":  i.get("fornecedorSugerido"),
+                "prazo":       i.get("prazoDesejado"),
+                "justificativa": i.get("justificativa"),
+            } for i in items]
+        }, ensure_ascii=False, indent=2)
     except Exception as e:
         return json.dumps({"erro": str(e)})
 
-# ─── TOOL 4: recomendações da IA ──────────────────────────────────
+# ─── TOOL 4: recomendações da IA ─────────────────────────────────
 @mcp.tool()
-def get_recomendacoes(
-    unidade_id: str = "",
-    prioridade: str = "",
-) -> str:
+def get_recomendacoes(unidade_id: str = "", prioridade: str = "") -> str:
     """
-    Retorna recomendações geradas pelo gpt-4o para lojas da rede.
-    unidade_id: ID da loja (ex: u147), opcional. prioridade: ALTA, MEDIA, BAIXA, opcional.
-    Exemplo: get_recomendacoes(unidade_id='u147') ou get_recomendacoes(prioridade='ALTA')
+    Retorna recomendações geradas pelo gpt-4o para as lojas.
+    unidade_id: ID da loja (ex: u147, opcional). prioridade: ALTA, MEDIA, BAIXA (opcional).
     """
     try:
-        filt = "status_code eq 'NOVA'"
+        data  = odata("Recomendacoes", {"$top": "100"})
+        items = [i for i in data.get("value", []) if i.get("status_code") == "NOVA"]
         if unidade_id:
-            filt += f" and unidade_ID eq '{unidade_id}'"
+            items = [i for i in items if i.get("unidade_ID") == unidade_id]
         if prioridade:
-            filt += f" and prioridade_code eq '{prioridade}'"
-        data = odata("Recomendacoes", {
-            "$filter": filt,
-            "$select": "unidade_ID,tipo_code,titulo,descricao,prioridade_code,status_code,dataGeracao",
-            "$orderby": "prioridade_code asc",
-        })
-        items = data.get("value", [])
+            items = [i for i in items if i.get("prioridade_code") == prioridade.upper()]
 
-        unidades_data = odata("Unidades", {"$select": "ID,nome,cidade"})
-        um = {u["ID"]: u for u in unidades_data.get("value", [])}
+        unids = {u["ID"]: u for u in odata("Unidades", {"$select": "ID,nome,cidade", "$top": "100"}).get("value", [])}
 
-        recs = [{
-            "loja":      um.get(i.get("unidade_ID"), {}).get("nome", i.get("unidade_ID")),
-            "cidade":    um.get(i.get("unidade_ID"), {}).get("cidade"),
-            "tipo":      i.get("tipo_code"),
-            "prioridade": i.get("prioridade_code"),
-            "titulo":    i.get("titulo"),
-            "descricao": i.get("descricao"),
-            "geradaEm":  i.get("dataGeracao"),
-        } for i in items]
-
-        return json.dumps({"total": len(recs), "recomendacoes": recs}, ensure_ascii=False, indent=2)
+        return json.dumps({
+            "total": len(items),
+            "recomendacoes": [{
+                "loja":      unids.get(i.get("unidade_ID"), {}).get("nome", i.get("unidade_ID")),
+                "tipo":      i.get("tipo_code"),
+                "prioridade": i.get("prioridade_code"),
+                "titulo":    i.get("titulo"),
+                "descricao": i.get("descricao"),
+            } for i in items]
+        }, ensure_ascii=False, indent=2)
     except Exception as e:
         return json.dumps({"erro": str(e)})
 
-# ─── TOOL 5: score de saúde da rede ───────────────────────────────
+# ─── TOOL 5: score de saúde ───────────────────────────────────────
 @mcp.tool()
-def get_score_rede(
-    regiao: str = "",
-    cluster: str = "",
-    somente_criticas: bool = False,
-) -> str:
+def get_score_rede(regiao: str = "", somente_criticas: bool = False) -> str:
     """
-    Retorna o score de saúde das lojas da rede com resumo e detalhes.
-    regiao: NE, S, SE, CO, N (opcional). cluster: STD, EXP, FLG (opcional).
-    somente_criticas: se True, retorna apenas lojas com score crítico (vermelho).
-    Exemplo: get_score_rede(regiao='NE') ou get_score_rede(somente_criticas=True)
+    Retorna o score de saúde das lojas da rede.
+    regiao: NE, S, SE, CO, N (opcional). somente_criticas: True para só lojas críticas.
     """
     try:
-        filt_parts = []
+        data  = odata("Saude_Dashboard", {"$top": "100"})
+        all_  = data.get("value", [])
+        items = list(all_)
         if regiao:
-            filt_parts.append(f"regiao_code eq '{regiao}'")
-        if cluster:
-            filt_parts.append(f"cluster_code eq '{cluster}'")
+            items = [i for i in items if i.get("regiao_code") == regiao]
         if somente_criticas:
-            filt_parts.append("scoreCriticality eq 1")
+            items = [i for i in items if int(i.get("scoreCriticality") or 3) == 1]
+        items.sort(key=lambda i: float(i.get("scoreSaude") or 100))
 
-        params = {
-            "$select": "nome,cidade,regiao_code,cluster_code,scoreSaude,compliancePct,performancePct,qtdAlertasAlta,scoreCriticality",
-            "$orderby": "scoreSaude asc",
-            "$top": "20",
-        }
-        if filt_parts:
-            params["$filter"] = " and ".join(filt_parts)
-
-        data    = odata("Saude_Dashboard", params)
-        all_data = odata("Saude_Dashboard", {"$select": "scoreSaude,scoreCriticality"})
-        all_items = all_data.get("value", [])
-        items    = data.get("value", [])
-
-        resumo = {
-            "total":     len(all_items),
-            "criticas":  sum(1 for i in all_items if i.get("scoreCriticality") == 1),
-            "atencao":   sum(1 for i in all_items if i.get("scoreCriticality") == 2),
-            "saudaveis": sum(1 for i in all_items if i.get("scoreCriticality") == 3),
-            "scoreMedia": round(sum(float(i.get("scoreSaude", 0)) for i in all_items) / len(all_items), 1) if all_items else 0,
-        }
-
-        lojas = [{
-            "loja":       i.get("nome"),
-            "cidade":     i.get("cidade"),
-            "regiao":     i.get("regiao_code"),
-            "cluster":    i.get("cluster_code"),
-            "score":      i.get("scoreSaude"),
-            "compliance": i.get("compliancePct"),
-            "performance": i.get("performancePct"),
-            "alertasAlta": i.get("qtdAlertasAlta"),
-            "criticidade": "CRÍTICO" if i.get("scoreCriticality") == 1 else "ATENÇÃO" if i.get("scoreCriticality") == 2 else "SAUDÁVEL",
-        } for i in items]
-
-        return json.dumps({"resumo_rede": resumo, "lojas": lojas}, ensure_ascii=False, indent=2)
+        return json.dumps({
+            "resumo_rede": {
+                "total":     len(all_),
+                "criticas":  sum(1 for i in all_ if int(i.get("scoreCriticality") or 3) == 1),
+                "atencao":   sum(1 for i in all_ if int(i.get("scoreCriticality") or 3) == 2),
+                "saudaveis": sum(1 for i in all_ if int(i.get("scoreCriticality") or 3) == 3),
+                "scoreMedia": round(sum(float(i.get("scoreSaude") or 0) for i in all_) / len(all_), 1) if all_ else 0,
+            },
+            "lojas": [{
+                "loja":       i.get("nome"),
+                "cidade":     i.get("cidade"),
+                "regiao":     i.get("regiao_code"),
+                "cluster":    i.get("cluster_code"),
+                "score":      i.get("scoreSaude"),
+                "criticidade": "CRÍTICO" if int(i.get("scoreCriticality") or 3) == 1 else "ATENÇÃO" if int(i.get("scoreCriticality") or 3) == 2 else "SAUDÁVEL",
+            } for i in items[:20]]
+        }, ensure_ascii=False, indent=2)
     except Exception as e:
         return json.dumps({"erro": str(e)})
 
@@ -366,40 +276,18 @@ if __name__ == "__main__":
 
     mcp_app = mcp.streamable_http_app()
 
-    class TokenPropagationMiddleware(BaseHTTPMiddleware):
-        """Propaga o Bearer token recebido do Joule Studio (via destination OAuth2) para as tools."""
-        async def dispatch(self, request: StarletteRequest, call_next):
-            auth = request.headers.get("authorization", "")
-            if auth.lower().startswith("bearer "):
-                token = auth[7:]
-                _request_token.set(token)
-            return await call_next(request)
-
     class HealthMiddleware(BaseHTTPMiddleware):
         async def dispatch(self, request: StarletteRequest, call_next):
             if request.url.path == "/health":
                 return JSONResponse({
-                    "status": "UP",
-                    "service": "joule-myfranchise-mcp",
-                    "version": "1.0.0",
-                    "tools": ["get_lojas_em_risco", "get_cobertura_estoque",
-                              "get_pedidos_pendentes", "get_recomendacoes", "get_score_rede"],
+                    "status": "UP", "service": "joule-myfranchise-mcp", "version": "1.0.0",
+                    "tools": ["get_lojas_em_risco","get_cobertura_estoque","get_pedidos_pendentes","get_recomendacoes","get_score_rede"],
                     "mes_referencia": MES_REF,
                 })
             return await call_next(request)
 
     app = mcp_app
-    app = TokenPropagationMiddleware(app)
     app = HealthMiddleware(app)
-
-    # TrustedHostMiddleware: obrigatório no CF — o Go Router faz proxy reverso
-    # e o Host header pode causar 421 sem este middleware.
     app = TrustedHostMiddleware(app, allowed_hosts=["*"])
 
-    uvicorn.run(
-        app,
-        host="0.0.0.0",
-        port=PORT,
-        forwarded_allow_ips="*",
-        proxy_headers=True,
-    )
+    uvicorn.run(app, host="0.0.0.0", port=PORT, forwarded_allow_ips="*", proxy_headers=True)
