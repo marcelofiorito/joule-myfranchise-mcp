@@ -52,6 +52,26 @@ def get_token() -> str:
     if not TOKEN_URL or not CLIENT_ID or not CLIENT_SECRET:
         return ""  # modo dev local sem auth
 
+import contextvars
+
+# Token propagado pelo Joule via Authorization header da destination OAuth2
+_request_token: contextvars.ContextVar[str] = contextvars.ContextVar('request_token', default='')
+
+def get_token() -> str:
+    """Retorna o token da request atual (injetado pelo middleware) ou gera via client_credentials."""
+    import time
+    # preferir token propagado pelo Joule Studio via destination OAuth2ClientCredentials
+    req_token = _request_token.get('')
+    if req_token:
+        return req_token
+
+    now = time.time()
+    if _token_cache.get("token") and _token_cache.get("expires", 0) > now + 60:
+        return _token_cache["token"]
+
+    if not TOKEN_URL or not CLIENT_ID or not CLIENT_SECRET:
+        return ""
+
     resp = requests.post(TOKEN_URL, data={
         "grant_type": "client_credentials",
         "client_id": CLIENT_ID,
@@ -339,6 +359,15 @@ if __name__ == "__main__":
 
     mcp_app = mcp.streamable_http_app()
 
+    class TokenPropagationMiddleware(BaseHTTPMiddleware):
+        """Propaga o Bearer token recebido do Joule Studio (via destination OAuth2) para as tools."""
+        async def dispatch(self, request: StarletteRequest, call_next):
+            auth = request.headers.get("authorization", "")
+            if auth.lower().startswith("bearer "):
+                token = auth[7:]
+                _request_token.set(token)
+            return await call_next(request)
+
     class HealthMiddleware(BaseHTTPMiddleware):
         async def dispatch(self, request: StarletteRequest, call_next):
             if request.url.path == "/health":
@@ -353,6 +382,7 @@ if __name__ == "__main__":
             return await call_next(request)
 
     app = mcp_app
+    app = TokenPropagationMiddleware(app)
     app = HealthMiddleware(app)
 
     # TrustedHostMiddleware: obrigatório no CF — o Go Router faz proxy reverso
