@@ -326,15 +326,23 @@ async def health(request):
 # ─── Montar aplicação ASGI ────────────────────────────────────────
 mcp_app = mcp.streamable_http_app()
 
-app = Starlette(routes=[
-    Route("/health", health),
-    Mount("/mcp", mcp_app),
-])
+# ─── Montar aplicação ASGI ────────────────────────────────────────
+# IMPORTANTE: Mount na raiz "/" para evitar 307 redirect do Starlette.
+# O Joule Studio não segue redirects — /mcp → /mcp/ causa 404.
+# Solução: health em /health, MCP montado na raiz (captura tudo exceto /health).
+mcp_app = mcp.streamable_http_app()
+
+app = Starlette(
+    routes=[
+        Route("/health", health),
+        Mount("/", mcp_app),   # MCP na raiz — sem trailing slash redirect
+    ]
+)
 
 # ─── Iniciar servidor ─────────────────────────────────────────────
 if __name__ == "__main__":
     import uvicorn
     print(f"✅ joule-myfranchise-mcp iniciado na porta {PORT}")
     print(f"   Health: http://localhost:{PORT}/health")
-    print(f"   MCP:    http://localhost:{PORT}/mcp")
+    print(f"   MCP:    http://localhost:{PORT}/")
     uvicorn.run(app, host="0.0.0.0", port=PORT)
