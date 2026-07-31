@@ -21,6 +21,14 @@ import os
 import json
 import requests
 from mcp.server.fastmcp import FastMCP
+try:
+    from mcp.server.transport_security import TransportSecuritySettings
+    _has_transport_security = True
+except ImportError:
+    _has_transport_security = False
+
+# Host do CF onde o app está rodando (evita 421 DNS rebinding protection)
+CF_HOST = os.environ.get("CF_HOST", "joule-myfranchise-mcp.cfapps.us10.hana.ondemand.com")
 
 # ─── Configuração ─────────────────────────────────────────────────
 SRV_URL        = os.environ.get("SRV_URL", "http://localhost:4004")
@@ -67,16 +75,27 @@ def odata(path: str, params: dict = None) -> dict:
     return resp.json()
 
 # ─── FastMCP Server ───────────────────────────────────────────────
-mcp = FastMCP(
-    "RunMyFranchise Joule",
-    instructions=(
+mcp_kwargs = {
+    "instructions": (
         "Você é o assistente inteligente da rede de franquias RunMyFranchise. "
         "Use as ferramentas disponíveis para responder perguntas sobre estoque, "
         "risco de ruptura, recomendações da IA, score de saúde e pedidos de reposição. "
         "Considere sempre a sazonalidade regional: Havaianas em julho têm demanda "
         "muito maior no Nordeste do que no Sul. Apresente números de forma clara."
     ),
-)
+}
+if _has_transport_security:
+    mcp_kwargs["transport_security"] = TransportSecuritySettings(
+        enable_dns_rebinding_protection=True,
+        allowed_hosts=[
+            CF_HOST,
+            "localhost:*",
+            "127.0.0.1:*",
+            "*.cfapps.us10.hana.ondemand.com",
+        ],
+    )
+
+mcp = FastMCP("RunMyFranchise Joule", **mcp_kwargs)
 
 # ─── TOOL 1: lojas em risco de ruptura ───────────────────────────
 @mcp.tool()
