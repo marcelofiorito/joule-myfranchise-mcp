@@ -308,47 +308,38 @@ def get_score_rede(
     except Exception as e:
         return json.dumps({"erro": str(e)})
 
-# ─── Health endpoint ──────────────────────────────────────────────
-
-# ─── Montar aplicação ASGI ────────────────────────────────────────
-mcp_app = mcp.streamable_http_app()
-
-# ─── Montar aplicação ASGI ────────────────────────────────────────
-# Padrão do joule-sfsf-mcp: o streamable_http_app() já expõe em /mcp
-# internamente. Adicionamos /health via middleware — sem Mount que causa 307.
-from starlette.middleware.base import BaseHTTPMiddleware
-from starlette.requests import Request as StarletteRequest
-
-mcp_app = mcp.streamable_http_app()
-
-class HealthMiddleware(BaseHTTPMiddleware):
-    async def dispatch(self, request: StarletteRequest, call_next):
-        if request.url.path == "/health":
-            from starlette.responses import JSONResponse
-            return JSONResponse({
-                "status": "UP",
-                "service": "joule-myfranchise-mcp",
-                "version": "1.0.0",
-                "tools": ["get_lojas_em_risco", "get_cobertura_estoque",
-                          "get_pedidos_pendentes", "get_recomendacoes", "get_score_rede"],
-                "mes_referencia": MES_REF,
-            })
-        return await call_next(request)
-
-app = HealthMiddleware(mcp_app)
-
-# TrustedHostMiddleware com allowed_hosts=["*"] — obrigatório no CF.
-# O Go Router faz proxy reverso e o Host header pode não bater com o app hostname,
-# causando 421 Invalid Host header sem esse middleware.
-from starlette.middleware.trustedhost import TrustedHostMiddleware
-app = TrustedHostMiddleware(app, allowed_hosts=["*"])
-
-# ─── Iniciar servidor ─────────────────────────────────────────────
+# ─── Entrypoint HTTP para Cloud Foundry ──────────────────────────
 if __name__ == "__main__":
     import uvicorn
-    print(f"✅ joule-myfranchise-mcp iniciado na porta {PORT}")
-    print(f"   Health: http://localhost:{PORT}/health")
-    print(f"   MCP:    http://localhost:{PORT}/mcp")
+    from starlette.middleware.base import BaseHTTPMiddleware
+    from starlette.middleware.trustedhost import TrustedHostMiddleware
+    from starlette.requests import Request as StarletteRequest
+    from starlette.responses import JSONResponse
+
+    print(f"✅ joule-myfranchise-mcp iniciando na porta {PORT}")
+
+    mcp_app = mcp.streamable_http_app()
+
+    class HealthMiddleware(BaseHTTPMiddleware):
+        async def dispatch(self, request: StarletteRequest, call_next):
+            if request.url.path == "/health":
+                return JSONResponse({
+                    "status": "UP",
+                    "service": "joule-myfranchise-mcp",
+                    "version": "1.0.0",
+                    "tools": ["get_lojas_em_risco", "get_cobertura_estoque",
+                              "get_pedidos_pendentes", "get_recomendacoes", "get_score_rede"],
+                    "mes_referencia": MES_REF,
+                })
+            return await call_next(request)
+
+    app = mcp_app
+    app = HealthMiddleware(app)
+
+    # TrustedHostMiddleware: obrigatório no CF — o Go Router faz proxy reverso
+    # e o Host header pode causar 421 sem este middleware.
+    app = TrustedHostMiddleware(app, allowed_hosts=["*"])
+
     uvicorn.run(
         app,
         host="0.0.0.0",
