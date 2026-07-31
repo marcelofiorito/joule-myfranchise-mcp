@@ -337,10 +337,22 @@ class HealthMiddleware(BaseHTTPMiddleware):
 
 app = HealthMiddleware(mcp_app)
 
+# TrustedHostMiddleware com allowed_hosts=["*"] — obrigatório no CF.
+# O Go Router faz proxy reverso e o Host header pode não bater com o app hostname,
+# causando 421 Invalid Host header sem esse middleware.
+from starlette.middleware.trustedhost import TrustedHostMiddleware
+app = TrustedHostMiddleware(app, allowed_hosts=["*"])
+
 # ─── Iniciar servidor ─────────────────────────────────────────────
 if __name__ == "__main__":
     import uvicorn
     print(f"✅ joule-myfranchise-mcp iniciado na porta {PORT}")
     print(f"   Health: http://localhost:{PORT}/health")
     print(f"   MCP:    http://localhost:{PORT}/mcp")
-    uvicorn.run(app, host="0.0.0.0", port=PORT)
+    uvicorn.run(
+        app,
+        host="0.0.0.0",
+        port=PORT,
+        forwarded_allow_ips="*",
+        proxy_headers=True,
+    )
